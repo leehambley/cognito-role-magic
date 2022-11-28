@@ -7,6 +7,12 @@ import * as AmazonCognitoIdentity from "amazon-cognito-identity-js";
 import * as ClientOAuth2 from "client-oauth2";
 import { faker } from "@faker-js/faker";
 import { URL } from "url";
+import * as TE from 'fp-ts/TaskEither';
+import * as E from 'fp-ts/Either';
+import * as RTE from 'fp-ts/ReaderTaskEither';
+import { pipe } from "fp-ts/lib/function";
+import AWS = require("aws-sdk");
+import { GetIdResponse } from "@aws-sdk/client-cognito-identity";
 
 // create a user with CLI
 // $ aws cognito-idp admin-create-user  --user-pool-id "{Please type your userpool id}"  --username "test-user-paprika"
@@ -18,6 +24,8 @@ const cognitoUrl = new URL(cognitoDomain);
 const redirectUri = "https://my-app-domain.com/welcome";
 const clientId = "3qqv6keae0cq7g8cldq98ebvnh"; // from an App in the associated pool
 const poolId = "eu-central-1_sjpZO6EE3";
+const accountId = "449730099454";
+const identityPoolId = "eu-central-1:feb497f6-166a-4de9-b36d-fdec0d210eef";
 
 const oAuth2Client = new ClientOAuth2({
   clientId: "abc",
@@ -60,6 +68,10 @@ const signUp = async ({
   );
 };
 
+interface SignInDeps {
+  // empty, should take an AmazonCognitoIdentity.CognitoUser
+  // or something
+}
 interface SignInParams {
   username: string;
   password: string;
@@ -67,30 +79,50 @@ interface SignInParams {
   poolId: string;
 }
 // https://aws.amazon.com/blogs/mobile/understanding-amazon-cognito-user-pool-oauth-2-0-grants/
-const signIn = async ({
-  clientId,
-  poolId,
-  username,
-  password,
-}: SignInParams): Promise<unknown> => {
-  const userPool = new AmazonCognitoIdentity.CognitoUserPool({
-    UserPoolId: poolId,
-    ClientId: clientId,
-  });
-  var userData = {
-    Username: username,
-    Pool: userPool,
-  };
-  return new Promise((resolve, reject) =>
-    new AmazonCognitoIdentity.CognitoUser(userData).authenticateUser(
+const signIn: RTE.ReaderTaskEither<SignInParams, Error, AmazonCognitoIdentity.CognitoUserSession> = ({username, password, poolId}) => TE.tryCatch(() => new Promise((resolve, reject) =>
+    new AmazonCognitoIdentity.CognitoUser({
+      Username: username,
+      Pool: new AmazonCognitoIdentity.CognitoUserPool({
+        UserPoolId: poolId,
+        ClientId: clientId,
+      }),
+    }).authenticateUser(
       new AmazonCognitoIdentity.AuthenticationDetails({
         Username: username,
         Password: password,
       }),
       { onSuccess: resolve, onFailure: reject }
     )
-  );
-};
+  ), E.toError);
+
+const identityIdFromIdToken: RTE.ReaderTaskEither<AmazonCognitoIdentity.CognitoIdToken, Error, [AmazonCognitoIdentity.CognitoIdToken, GetIdResponse]> = (idToken) => TE.tryCatch(
+  () => {
+    // https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/CognitoIdentity.html#getId-property
+    const cognitoIdentity = new AWS.CognitoIdentity(cognitoConfiguration);
+    const providerName = `cognito-idp.eu-central-1.amazonaws.com/${poolId}`;
+    const logins = {[providerName]: idToken.getJwtToken()};
+    const params = {
+      IdentityPoolId: identityPoolId,
+      AccountId: accountId,
+      Logins: logins,
+    };
+    return new Promise((resolve, reject) => cognitoIdentity.getId(params, (err, identityId) => err ? reject(err) : resolve([idToken, identityId]))) // TODO: should unpack identityId.IdentityId
+  }, E.toError
+);
+
+const credentialsFromIdentityId: RTE.ReaderTaskEither<[AmazonCognitoIdentity.CognitoIdToken, GetIdResponse], Error, unknown> = ([idToken, identityId]) => TE.tryCatch(
+  () => {
+    // https://docs.aws.amazon.com/AWSJavaScriptSDK/latest/AWS/CognitoIdentity.html#getId-property
+    const cognitoIdentity = new AWS.CognitoIdentity(cognitoConfiguration);
+    const providerName = `cognito-idp.eu-central-1.amazonaws.com/${poolId}`;
+    const logins = {[providerName]: idToken.getJwtToken()};
+    const params = {
+      IdentityId: identityId.IdentityId!, // todo remove the ! non-null assertion
+      Logins: logins,
+    };
+    return new Promise((resolve, reject) => cognitoIdentity.getCredentialsForIdentity(params, (err, data) => err ? reject(err) : resolve(JSON.stringify(data))))
+  }, E.toError
+);
 
 // can also use this to sign up users if we don't have the lambda pre-token thing.
 // const confirmSignUp = async ({username, clientId}: SignUpParams): Promise<AdminConfirmSignUpCommandOutput> => {
@@ -106,8 +138,6 @@ describe("connecting to aws", () => {
   const username = email;
   const password = "SuperSecret0101$$";
 
-  console.log({ email });
-
   beforeAll((done) => {
     signUp({ email, username, password, clientId })
       .then(console.log)
@@ -116,9 +146,14 @@ describe("connecting to aws", () => {
   });
 
   test("writing some contents to the db", (done) => {
-    signIn({ poolId, username, password, clientId })
-      .then(console.log)
-      .catch(console.error)
-      .finally(done);
+    pipe(
+      signIn({ poolId, username: username, password, clientId }),
+      TE.map((session) => session.getIdToken()),
+      TE.chain(identityIdFromIdToken),
+      TE.chain(credentialsFromIdentityId),
+      TE.map((res) => console.log({res})),
+      TE.map(() => done()),
+      TE.mapLeft(done),
+    )();
   });
 });
